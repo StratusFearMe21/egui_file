@@ -12,7 +12,10 @@ repository = "https://github.com/Barugon/egui_file"
 version = "0.6.0"
 
 [dependencies]
-fst = "0.4.7"
+fst = { version = "0.4.7", path = "../fst" }
+glidesort = "0.1.2"
+memchr = "2.5.0"
+parking_lot = "0.12.1"
 
 [dependencies.egui]
 version = "0.20"

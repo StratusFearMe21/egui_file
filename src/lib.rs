@@ -1,15 +1,31 @@
+#![feature(iter_collect_into)]
+
 use egui::{
   text::CCursor, text_edit::TextEditState, vec2, Align2, Context, Key, Layout, Pos2, RichText,
   ScrollArea, TextEdit, Ui, Vec2, Window,
 };
-use fst::raw::Fst;
+use fst::{
+  automaton::{AlwaysMatch, StartsWith, Str},
+  raw::Fst,
+  Automaton, Error, IntoStreamer, Streamer,
+};
 use std::{
+  borrow::Cow,
   env,
   fmt::Debug,
-  fs,
-  io::Error,
+  fs::{self, ReadDir},
   path::{Path, PathBuf},
 };
+
+macro_rules! seperator {
+  () => {
+    if cfg!(not(windows)) {
+      '/'
+    } else {
+      '\\'
+    }
+  };
+}
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 /// Dialog state.
@@ -24,6 +40,12 @@ pub enum State {
   Selected,
 }
 
+enum ReadDirState {
+  Loading(ReadDir),
+  Fst(usize, fst::raw::Builder<Vec<u8>>),
+  Done,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Dialog type.
 pub enum DialogType {
@@ -34,7 +56,9 @@ pub enum DialogType {
 
 struct CompleterState {
   folder_depth: usize,
+  current_tooltip: Option<Cow<'static, str>>,
   machine: Fst<Vec<u8>>,
+  too_large: bool,
 }
 
 /// `egui` component that represents `OpenFileDialog` or `SaveFileDialog`.
@@ -45,18 +69,21 @@ pub struct FileDialog {
   path_edit: String,
 
   /// Selected file path
-  selected_file: Option<PathBuf>,
+  selected_file: Option<String>,
   /// Editable field with filename.
   filename_edit: String,
 
   /// Files in directory.
-  files: Result<Vec<PathBuf>, Error>,
+  files: Result<Vec<String>, Error>,
   /// The file completer
   completion: CompleterState,
   /// Current dialog state.
   state: State,
   /// Dialog type.
   dialog_type: DialogType,
+
+  /// File reading state
+  reading_state: ReadDirState,
 
   current_pos: Option<Pos2>,
   default_size: Vec2,
@@ -70,6 +97,8 @@ pub struct FileDialog {
   // Show hidden files on unix systems.
   #[cfg(unix)]
   show_hidden: bool,
+  #[cfg(unix)]
+  hidden_files: usize,
 }
 
 impl Debug for FileDialog {
@@ -120,26 +149,26 @@ impl Debug for FileDialog {
 }
 
 /// Function that returns `true` if the path is accepted.
-pub type Filter = Box<dyn Fn(&Path) -> bool + Send + 'static>;
+pub type Filter = fn(&Path) -> bool;
 
 impl FileDialog {
   /// Create dialog that prompts the user to select a folder.
   pub fn select_folder(initial_path: Option<PathBuf>) -> Self {
-    FileDialog::new(DialogType::SelectFolder, initial_path)
+    FileDialog::new(DialogType::SelectFolder, initial_path, None)
   }
 
   /// Create dialog that prompts the user to open a file.
-  pub fn open_file(initial_path: Option<PathBuf>) -> Self {
-    FileDialog::new(DialogType::OpenFile, initial_path)
+  pub fn open_file(initial_path: Option<PathBuf>, filter: Option<Filter>) -> Self {
+    FileDialog::new(DialogType::OpenFile, initial_path, filter)
   }
 
   /// Create dialog that prompts the user to save a file.
-  pub fn save_file(initial_path: Option<PathBuf>) -> Self {
-    FileDialog::new(DialogType::SaveFile, initial_path)
+  pub fn save_file(initial_path: Option<PathBuf>, filter: Option<Filter>) -> Self {
+    FileDialog::new(DialogType::SaveFile, initial_path, filter)
   }
 
   /// Constructs new file dialog. If no `initial_path` is passed,`env::current_dir` is used.
-  fn new(dialog_type: DialogType, initial_path: Option<PathBuf>) -> Self {
+  fn new(dialog_type: DialogType, initial_path: Option<PathBuf>, filter: Option<Filter>) -> Self {
     let mut path = initial_path.unwrap_or_else(|| env::current_dir().unwrap_or_default());
     let mut filename_edit = String::new();
 
@@ -149,34 +178,44 @@ impl FileDialog {
       path.pop();
     }
 
-    let path_edit = path.to_str().unwrap_or_default().to_string();
-    let files = read_folder(&path);
-    let machine = create_machine(&path).unwrap();
+    let mut path_edit = path.to_str().unwrap_or_default().to_string();
+    if path.is_dir() {
+      path_edit.push(seperator!());
+    }
 
-    Self {
+    let mut s = Self {
       completion: CompleterState {
-        folder_depth: path.components().count(),
-        machine,
+        folder_depth: { memchr::memchr_iter(seperator!() as u8, path_edit.as_bytes()).count() },
+        current_tooltip: None,
+        machine: Fst::from_iter_set([[]]).unwrap(),
+        too_large: false,
       },
       path,
       path_edit,
       selected_file: None,
       filename_edit,
-      files,
+      files: Ok(Vec::new()),
+      reading_state: ReadDirState::Done,
       state: State::Closed,
       dialog_type,
       current_pos: None,
       default_size: vec2(512.0, 512.0),
       scrollarea_max_height: 320.0,
       anchor: None,
-      filter: None,
+      filter,
       resizable: true,
       rename: true,
       new_folder: true,
 
       #[cfg(unix)]
       show_hidden: false,
-    }
+      #[cfg(unix)]
+      hidden_files: 0,
+    };
+
+    s.refresh();
+
+    s
   }
 
   /// Set the window anchor.
@@ -197,7 +236,7 @@ impl FileDialog {
     self
   }
 
-  /// Set the maximum size for the inner [ScrollArea]
+  /// Set the maximum height for the inner [ScrollArea]
   pub fn scrollarea_max_height(mut self, max: f32) -> Self {
     self.scrollarea_max_height = max;
     self
@@ -224,6 +263,7 @@ impl FileDialog {
   /// Set a function to filter shown files.
   pub fn filter(mut self, filter: Filter) -> Self {
     self.filter = Some(filter);
+    self.refresh();
     self
   }
 
@@ -244,7 +284,7 @@ impl FileDialog {
 
   /// Resulting file path.
   pub fn path(&self) -> Option<PathBuf> {
-    self.selected_file.clone()
+    self.selected_file.as_ref().map(|f| self.path.join(f))
   }
 
   /// Dialog state.
@@ -259,10 +299,10 @@ impl FileDialog {
 
   fn open_selected(&mut self) {
     if let Some(path) = &self.selected_file {
-      if path.is_dir() {
-        self.path = path.clone();
+      if path.ends_with(seperator!()) {
+        self.path = self.path.join(path);
         self.refresh();
-      } else if path.is_file() && self.dialog_type == DialogType::OpenFile {
+      } else if self.dialog_type == DialogType::OpenFile {
         self.confirm();
       }
     }
@@ -272,17 +312,127 @@ impl FileDialog {
     self.state = State::Selected;
   }
 
+  fn read_dir_into(&mut self) -> usize {
+    if let ReadDirState::Loading(ref mut paths) = self.reading_state {
+      let iter = paths
+        .filter_map(|result| result.ok())
+        .filter(|entry| {
+          if entry.path().is_dir() {
+            return true;
+          }
+
+          if self.dialog_type == DialogType::SelectFolder {
+            return false;
+          }
+
+          if !entry.path().is_file() {
+            return false;
+          }
+
+          // Filter.
+          if let Some(filter) = self.filter {
+            filter(&entry.path())
+          } else {
+            println!("No filter");
+            false
+          }
+        })
+        .map(|entry| {
+          let mut file_name = entry.file_name().into_string().unwrap();
+          #[cfg(unix)]
+          if file_name.starts_with('.') {
+            self.hidden_files += 1;
+          }
+          if entry.path().is_dir() {
+            #[cfg(not(windows))]
+            file_name.push('/');
+            #[cfg(windows)]
+            file_name.push('\\');
+          }
+          file_name
+        });
+
+      if let Ok(ref mut files) = self.files {
+        let current_len = files.len();
+        iter.take(5000).collect_into(files);
+        let new_len = files.len();
+
+        new_len - current_len
+      } else {
+        0
+      }
+    } else {
+      0
+    }
+  }
+
   fn refresh(&mut self) {
-    self.files = read_folder(&self.path);
-    self.completion.folder_depth = self.path.components().count();
-    self.completion.machine = create_machine(&self.path).unwrap();
+    self.hidden_files = 0;
+    match fs::read_dir(&self.path) {
+      Ok(paths) => {
+        self.files = Ok(Vec::new());
+        self.reading_state = ReadDirState::Loading(paths);
+        let read = self.read_dir_into();
+
+        if let Ok(ref mut files) = self.files {
+          glidesort::sort_in_vec(files);
+
+          if read < 5000 {
+            self.completion.machine = Fst::from_iter_set(files.iter()).unwrap();
+
+            self.reading_state = ReadDirState::Done;
+          }
+        }
+      }
+      Err(e) => self.files = Err(fst::Error::Io(e)),
+    }
+    self.completion.folder_depth =
+      memchr::memchr_iter(seperator!() as u8, self.path_edit.as_bytes()).count();
     self.path_edit = String::from(self.path.to_str().unwrap_or_default());
     self.select(None);
   }
 
-  fn select(&mut self, file: Option<PathBuf>) {
+  fn read_more(&mut self) {
+    match &mut self.reading_state {
+      ReadDirState::Loading(_) => {
+        if self.read_dir_into() < 5000 {
+          if let Ok(ref mut files) = self.files {
+            glidesort::sort_in_vec(files);
+
+            self.reading_state = ReadDirState::Fst(0, fst::raw::Builder::memory());
+          }
+        }
+      }
+
+      ReadDirState::Fst(pos, builder) => {
+        if let Ok(ref files) = self.files {
+          if (*pos + 500) < files.len() {
+            files[*pos..*pos + 500]
+              .iter()
+              .for_each(|f| builder.add(f).unwrap());
+
+            *pos += 500;
+          } else {
+            files[*pos..].iter().for_each(|f| builder.add(f).unwrap());
+
+            let mut builder_buf = fst::raw::Builder::memory();
+            std::mem::swap(&mut builder_buf, builder);
+            self.completion.machine = builder_buf.into_fst();
+
+            self.reading_state = ReadDirState::Done;
+          }
+        } else {
+          self.reading_state = ReadDirState::Done;
+        }
+      }
+
+      ReadDirState::Done => {}
+    }
+  }
+
+  fn select(&mut self, file: Option<String>) {
     self.filename_edit = match &file {
-      Some(path) => get_file_name(path).to_string(),
+      Some(path) => path.clone(),
       None => String::new(),
     };
     self.selected_file = file;
@@ -299,7 +449,7 @@ impl FileDialog {
   fn can_rename(&self) -> bool {
     if !self.filename_edit.is_empty() {
       if let Some(file) = &self.selected_file {
-        return get_file_name(file) != self.filename_edit;
+        return self.filename_edit.ne(file);
       }
     }
     false
@@ -363,10 +513,11 @@ impl FileDialog {
       Refresh,
       Rename(PathBuf, PathBuf),
       Save(PathBuf),
-      Select(PathBuf),
+      Select(String),
       UpDirectory,
     }
     let mut command: Option<Command> = None;
+    self.read_more();
 
     // Top directory field with buttons.
     ui.horizontal(|ui| {
@@ -377,15 +528,25 @@ impl FileDialog {
         }
       });
       ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-        let response = ui.button("⟲").on_hover_text_at_pointer("Refresh");
-        if response.clicked() {
-          command = Some(Command::Refresh);
-        }
+        ui.add_enabled_ui(matches!(self.reading_state, ReadDirState::Done), |ui| {
+          let response = ui.button("⟲").on_hover_text_at_pointer("Refresh");
+          if response.clicked() {
+            command = Some(Command::Refresh);
+          }
+        });
 
-        let response = ui.add_sized(
+        let mut response = ui.add_sized(
           ui.available_size(),
           TextEdit::singleline(&mut self.path_edit),
         );
+        if let Some(ref tooltip) = self.completion.current_tooltip {
+          egui::containers::show_tooltip_for(
+            ui.ctx(),
+            response.id.with("__tooltip"),
+            &response.rect,
+            |ui| ui.label(tooltip.as_ref()),
+          );
+        }
         if response.has_focus() {
           ui.memory().lock_focus(response.id, true);
           if ui.input().key_pressed(Key::Tab) {
@@ -393,6 +554,7 @@ impl FileDialog {
               text_state.set_ccursor_range(None);
               text_state.store(ui.ctx(), response.id);
             }
+            response.mark_changed();
           }
         }
         'fst: {
@@ -404,100 +566,224 @@ impl FileDialog {
               .to_str()
               .unwrap_or_default();
 
-            let depth = current_path.components().count();
-            if depth != self.completion.folder_depth || file_name.is_empty() {
-              self.completion.folder_depth = depth;
-              self.completion.machine = create_machine(if current_path.is_dir() {
-                &current_path
+            let depth = memchr::memchr_iter(seperator!() as u8, self.path_edit.as_bytes()).count();
+            if depth != self.completion.folder_depth {
+              if let Ok(paths) = fs::read_dir(
+                if depth > self.completion.folder_depth || self.path_edit.ends_with(seperator!()) {
+                  &current_path
+                } else {
+                  current_path.parent().unwrap_or_else(
+                    #[cfg(windows)]
+                    || Path::new("C:\\"),
+                    #[cfg(not(windows))]
+                    || Path::new("/"),
+                  )
+                },
+              ) {
+                let mut paths: Vec<String> = paths
+                  .filter_map(|result| result.ok())
+                  .filter(|entry| {
+                    if entry.path().is_dir() {
+                      return true;
+                    }
+
+                    if self.dialog_type == DialogType::SelectFolder {
+                      return false;
+                    }
+
+                    if !entry.path().is_file() {
+                      return false;
+                    }
+
+                    // Filter.
+                    if let Some(filter) = self.filter {
+                      filter(&entry.path())
+                    } else {
+                      println!("No filter");
+                      false
+                    }
+                  })
+                  .filter_map(|entry| {
+                    let mut file_name = entry.file_name().into_string().unwrap();
+                    #[cfg(unix)]
+                    if file_name.starts_with('.') {
+                      return None;
+                    }
+                    if entry.path().is_dir() {
+                      #[cfg(not(windows))]
+                      file_name.push('/');
+                      #[cfg(windows)]
+                      file_name.push('\\');
+                    }
+                    Some(file_name)
+                  })
+                  .take(1000)
+                  .collect();
+
+                if paths.len() == 1000 {
+                  self.completion.current_tooltip =
+                    Some(Cow::Borrowed("Directory too large for completion"));
+                  self.completion.too_large = true;
+                } else {
+                  glidesort::sort_in_vec(&mut paths);
+                  self.completion.too_large = false;
+                  self.completion.machine = Fst::from_iter_set(paths.iter()).unwrap();
+                }
               } else {
-                current_path.parent().unwrap_or_else(
-                  #[cfg(windows)]
-                  || Path::new("C:\\"),
-                  #[cfg(not(windows))]
-                  || Path::new("/"),
-                )
-              })
-              .unwrap();
+                break 'fst;
+              }
+              self.completion.folder_depth = depth;
             }
 
-            if !ui.input().key_pressed(Key::Backspace) {
-              let mut node = self.completion.machine.root();
+            enum StreamType<'f> {
+              StartsWith(fst::raw::Stream<'f, StartsWith<Str<'f>>>),
+              Root(fst::raw::Stream<'f, AlwaysMatch>),
+            }
 
-              for &b in file_name.as_bytes() {
-                node = match node.find_input(b) {
-                  None => break 'fst,
-                  Some(i) => {
-                    let t = node.transition(i);
-                    self.completion.machine.node(t.addr)
-                  }
+            impl<'a, 'f> Streamer<'a> for StreamType<'f> {
+              type Item = &'a [u8];
+
+              fn next(&'a mut self) -> Option<Self::Item> {
+                match self {
+                  StreamType::StartsWith(s) => s.next().map(|f| f.0),
+                  StreamType::Root(r) => r.next().map(|f| f.0),
                 }
               }
 
-              if !node.is_final() {
-                let ccursor_start = self.path_edit.len();
-                while node.transitions().count() == 1 {
-                  let t = node.transitions().next().unwrap();
-                  self.path_edit.push(t.inp as char);
-                  node = self.completion.machine.node(t.addr);
+              fn next_start_node(&'a self) -> Option<fst::raw::Node<'_>> {
+                match self {
+                  StreamType::StartsWith(s) => s.next_start_node(),
+                  StreamType::Root(r) => r.next_start_node(),
                 }
-                let ccursor_end = self.path_edit.len();
-                if let Some(mut text_state) = TextEditState::load(ui.ctx(), response.id) {
-                  text_state.set_ccursor_range(Some(egui::text_edit::CCursorRange {
-                    primary: CCursor {
-                      index: ccursor_start,
-                      prefer_next_row: true,
-                    },
-                    secondary: CCursor {
-                      index: ccursor_end,
-                      prefer_next_row: true,
-                    },
-                  }));
+              }
+            }
 
-                  text_state.store(ui.ctx(), response.id);
+            if !self.completion.too_large {
+              let matcher = fst::automaton::Str::new(file_name).starts_with();
+              let backspace = ui.input().key_pressed(Key::Backspace);
+              let mut stream = if self.path_edit.ends_with(seperator!()) || backspace {
+                StreamType::Root(self.completion.machine.stream())
+              } else {
+                StreamType::StartsWith(
+                  self
+                    .completion
+                    .machine
+                    .search(matcher)
+                    .gt(file_name)
+                    .into_stream(),
+                )
+              };
+
+              if let Some(mut node) = stream.next_start_node() {
+                if node.len() == 1 && !node.is_final() && !backspace {
+                  let ccursor_start = self.path_edit.len();
+                  while node.len() == 1 {
+                    let t = node.transitions().next().unwrap();
+                    self.path_edit.push(t.inp as char);
+                    node = self.completion.machine.node(t.addr);
+                  }
+                  let ccursor_end = self.path_edit.len();
+
+                  if let Some(mut text_state) = TextEditState::load(ui.ctx(), response.id) {
+                    text_state.set_ccursor_range(Some(egui::text_edit::CCursorRange {
+                      primary: CCursor {
+                        index: ccursor_start,
+                        prefer_next_row: true,
+                      },
+                      secondary: CCursor {
+                        index: ccursor_end,
+                        prefer_next_row: true,
+                      },
+                    }));
+
+                    text_state.store(ui.ctx(), response.id);
+                  }
+
+                  self.completion.current_tooltip = None;
+                } else {
+                  let mut tooltip = String::new();
+                  let mut num_processed = 0;
+                  while let Some(key) = stream.next() {
+                    if num_processed > 500 {
+                      break;
+                    }
+                    let key = unsafe { std::str::from_utf8_unchecked(key) };
+                    #[cfg(unix)]
+                    if !self.show_hidden && key.starts_with('.') {
+                      continue;
+                    }
+                    std::fmt::Write::write_fmt(
+                      &mut tooltip,
+                      format_args!(
+                        "{}{}\n",
+                        if key.ends_with(seperator!()) {
+                          "🗀 "
+                        } else {
+                          "🗋 "
+                        },
+                        key
+                      ),
+                    )
+                    .unwrap();
+                    num_processed += 1;
+                  }
+                  if num_processed > 500 {
+                    tooltip.push('…');
+                  } else {
+                    tooltip.pop();
+                  }
+                  if !tooltip.is_empty() {
+                    self.completion.current_tooltip = Some(Cow::Owned(tooltip));
+                  } else {
+                    self.completion.current_tooltip = None;
+                  }
                 }
               } else {
                 break 'fst;
               }
             }
           }
+          if response.lost_focus() {
+            self.completion.current_tooltip = None;
+            let current_path = Path::new(&self.path_edit);
+            command = Some(Command::Open(current_path.to_path_buf()));
+          };
         }
-        if response.lost_focus() {
-          let path = PathBuf::from(&self.path_edit);
-          command = Some(Command::Open(path));
-        };
       });
     });
 
     // Rows with files.
     ui.separator();
+
+    let row_height = ui.spacing().interact_size.y;
+
     ScrollArea::vertical()
       .max_height(self.scrollarea_max_height)
-      .show(ui, |ui| {
-        match &self.files {
+      .show_rows(
+        ui,
+        row_height,
+        #[cfg(unix)]
+        self.files.as_ref().map_or(1, |f| {
+          if self.show_hidden {
+            f.len()
+          } else {
+            f.len() - self.hidden_files
+          }
+        }),
+        #[cfg(not(unix))]
+        self.files.as_ref().map_or(1, |f| f.len()),
+        |ui, #[cfg(not(unix))] range, #[cfg(unix)] mut range| match &self.files {
           Ok(files) => {
-            for path in files {
-              let is_dir = path.is_dir();
-
-              if !is_dir {
-                // Do not show system files.
-                if !path.is_file() {
-                  continue;
-                }
-
-                // Filter.
-                if let Some(filter) = &self.filter {
-                  if !filter(path) {
-                    continue;
-                  }
-                } else if self.dialog_type == DialogType::SelectFolder {
-                  continue;
-                }
-              }
-
-              let filename = get_file_name(path);
+            #[cfg(unix)]
+            if !self.show_hidden {
+              range.start += self.hidden_files;
+              range.end += self.hidden_files;
+            }
+            for path in files[range].iter() {
+              let is_dir = path.ends_with(seperator!());
 
               #[cfg(unix)]
-              if !self.show_hidden && filename.starts_with('.') {
+              if !self.show_hidden && path.starts_with('.') {
                 continue;
               }
 
@@ -507,7 +793,7 @@ impl FileDialog {
                   false => "🗋 ",
                 }
                 .to_string()
-                  + filename;
+                  + path;
 
                 let is_selected = Some(path) == self.selected_file.as_ref();
                 let selectable_label = ui.selectable_label(is_selected, label);
@@ -519,9 +805,9 @@ impl FileDialog {
                   command = Some(match self.dialog_type == DialogType::SaveFile {
                     true => match is_dir {
                       true => Command::OpenSelected,
-                      false => Command::Save(path.clone()),
+                      false => Command::Save(self.path.join(path)),
                     },
-                    false => Command::Open(path.clone()),
+                    false => Command::Open(self.path.join(path)),
                   });
                 }
               });
@@ -530,8 +816,8 @@ impl FileDialog {
           Err(e) => {
             ui.label(e.to_string());
           }
-        }
-      });
+        },
+      );
 
     // Bottom file field.
     ui.separator();
@@ -545,9 +831,10 @@ impl FileDialog {
         if self.rename {
           ui.add_enabled_ui(self.can_rename(), |ui| {
             if ui.button("Rename").clicked() {
-              if let Some(from) = self.selected_file.clone() {
+              if let Some(ref from) = self.selected_file {
+                let from = Path::new(from);
                 let to = from.with_file_name(&self.filename_edit);
-                command = Some(Command::Rename(from, to));
+                command = Some(Command::Rename(from.to_path_buf(), to));
               }
             }
           });
@@ -562,19 +849,23 @@ impl FileDialog {
           && result.ctx.input().key_pressed(egui::Key::Enter)
           && !self.filename_edit.is_empty()
         {
-          let path = self.path.join(&self.filename_edit);
+          let mut path = self.path.join(&self.filename_edit);
           match self.dialog_type {
             DialogType::SelectFolder => {
               command = Some(Command::Folder);
             }
             DialogType::OpenFile => {
               if path.exists() {
+                path.pop();
                 command = Some(Command::Open(path));
               }
             }
             DialogType::SaveFile => {
               command = Some(match path.is_dir() {
-                true => Command::Open(path),
+                true => {
+                  path.pop();
+                  Command::Open(path)
+                }
                 false => Command::Save(path),
               });
             }
@@ -588,7 +879,7 @@ impl FileDialog {
       match self.dialog_type {
         DialogType::SelectFolder => {
           let should_open = match &self.selected_file {
-            Some(file) => file.is_dir(),
+            Some(file) => file.ends_with(seperator!()),
             None => true,
           };
 
@@ -609,7 +900,7 @@ impl FileDialog {
         }
         DialogType::SaveFile => {
           let should_open_directory = match &self.selected_file {
-            Some(file) => file.is_dir(),
+            Some(file) => file.ends_with(seperator!()),
             None => false,
           };
 
@@ -648,20 +939,35 @@ impl FileDialog {
         Command::Folder => {
           let path = self.path.join(&self.filename_edit);
           self.selected_file = Some(match path.is_dir() {
-            true => path,
-            false => self.path.clone(),
+            true => path.file_name().unwrap().to_str().unwrap().to_string(),
+            false => self
+              .path
+              .clone()
+              .file_name()
+              .unwrap()
+              .to_str()
+              .unwrap()
+              .to_string(),
           });
           self.confirm();
         }
-        Command::Open(path) => {
-          self.select(Some(path));
+        Command::Open(mut path) => {
+          let mut file_name = path.file_name().unwrap().to_str().unwrap().to_string();
+
+          if path.is_dir() {
+            file_name.push(seperator!());
+          }
+
+          path.pop();
+          self.path = path;
+          self.select(Some(file_name));
           self.open_selected();
         }
         Command::OpenSelected => {
           self.open_selected();
         }
         Command::Save(file) => {
-          self.selected_file = Some(file);
+          self.selected_file = Some(file.file_name().unwrap().to_str().unwrap().to_string());
           self.confirm();
         }
         Command::Cancel => {
@@ -689,7 +995,10 @@ impl FileDialog {
           match fs::create_dir(&path) {
             Ok(_) => {
               self.refresh();
-              self.select(Some(path));
+              self.select(Some(
+                path.file_name().unwrap().to_str().unwrap().to_string()
+                  + if cfg!(windows) { "\\" } else { "/" },
+              ));
               // TODO: scroll to selected?
             }
             Err(err) => println!("Error while creating directory: {err}"),
@@ -698,7 +1007,7 @@ impl FileDialog {
         Command::Rename(from, to) => match fs::rename(from, &to) {
           Ok(_) => {
             self.refresh();
-            self.select(Some(to));
+            // self.select(Some(to));
           }
           Err(err) => println!("Error while renaming: {err}"),
         },
@@ -725,81 +1034,5 @@ fn get_file_name(path: &Path) -> &str {
       .file_name()
       .and_then(|name| name.to_str())
       .unwrap_or_default(),
-  }
-}
-
-#[cfg(windows)]
-extern "C" {
-  pub fn GetLogicalDrives() -> u32;
-}
-
-fn create_machine(path: &Path) -> Result<Fst<Vec<u8>>, fst::Error> {
-  match fs::read_dir(path) {
-    Ok(paths) => {
-      let mut result: Vec<String> = paths
-        .filter_map(|result| result.ok())
-        .map(|entry| {
-          let mut file_name = entry.file_name().into_string().unwrap();
-          if entry.path().is_dir() {
-            #[cfg(not(windows))]
-            file_name.push('/');
-            #[cfg(windows)]
-            file_name.push('\\');
-          }
-          file_name
-        })
-        .collect();
-
-      result.sort();
-
-      Fst::from_iter_set(result)
-    }
-    Err(e) => Err(fst::Error::Io(e)),
-  }
-}
-
-fn read_folder(path: &Path) -> Result<Vec<PathBuf>, Error> {
-  #[cfg(windows)]
-  let drives = {
-    let mut drives = unsafe { GetLogicalDrives() };
-    let mut letter = b'A';
-    let mut drive_names = Vec::new();
-    while drives > 0 {
-      if drives & 1 != 0 {
-        drive_names.push(format!("{}:\\", letter as char).into());
-      }
-      drives >>= 1;
-      letter += 1;
-    }
-    drive_names
-  };
-
-  match fs::read_dir(path) {
-    Ok(paths) => {
-      let mut result: Vec<PathBuf> = paths
-        .filter_map(|result| result.ok())
-        .map(|entry| entry.path())
-        .collect();
-
-      result.sort_by(|a, b| {
-        let da = a.is_dir();
-        let db = b.is_dir();
-        match da == db {
-          true => a.file_name().cmp(&b.file_name()),
-          false => db.cmp(&da),
-        }
-      });
-
-      #[cfg(windows)]
-      let result = {
-        let mut items = drives;
-        items.reserve(result.len());
-        items.append(&mut result);
-        items
-      };
-
-      Ok(result)
-    }
-    Err(e) => Err(e),
   }
 }

@@ -394,6 +394,8 @@ impl FileDialog {
 
   fn read_more(&mut self) {
     match &mut self.reading_state {
+      ReadDirState::Done => {}
+
       ReadDirState::Loading(_) => {
         if self.read_dir_into() < 5000 {
           if let Ok(ref mut files) = self.files {
@@ -425,8 +427,6 @@ impl FileDialog {
           self.reading_state = ReadDirState::Done;
         }
       }
-
-      ReadDirState::Done => {}
     }
   }
 
@@ -468,7 +468,7 @@ impl FileDialog {
   pub fn show(&mut self, ctx: &Context) -> &Self {
     self.state = match self.state {
       State::Open => {
-        if ctx.input().key_pressed(Key::Escape) {
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
           self.state = State::Cancelled;
         }
 
@@ -548,8 +548,8 @@ impl FileDialog {
           );
         }
         if response.has_focus() {
-          ui.memory().lock_focus(response.id, true);
-          if ui.input().key_pressed(Key::Tab) {
+          ui.memory(|m| m.lock_focus(response.id, true));
+          if ui.input(|i| i.key_pressed(Key::Tab)) {
             if let Some(mut text_state) = TextEditState::load(ui.ctx(), response.id) {
               text_state.set_ccursor_range(None);
               text_state.store(ui.ctx(), response.id);
@@ -660,7 +660,7 @@ impl FileDialog {
 
             if !self.completion.too_large {
               let matcher = fst::automaton::Str::new(file_name).starts_with();
-              let backspace = ui.input().key_pressed(Key::Backspace);
+              let backspace = ui.input(|i| i.key_pressed(Key::Backspace));
               let mut stream = if self.path_edit.ends_with(seperator!()) || backspace {
                 StreamType::Root(self.completion.machine.stream())
               } else {
@@ -846,7 +846,7 @@ impl FileDialog {
         );
 
         if result.lost_focus()
-          && result.ctx.input().key_pressed(egui::Key::Enter)
+          && result.ctx.input(|i| i.key_pressed(egui::Key::Enter))
           && !self.filename_edit.is_empty()
         {
           let mut path = self.path.join(&self.filename_edit);

@@ -357,8 +357,11 @@ impl FileDialog {
   }
 
   fn refresh(&mut self) {
-    #[cfg(unix)]
-    self.hidden_files = 0;
+    cfg_if::cfg_if! {
+      if #[cfg(unix)] {
+        self.hidden_files = 0;
+      }
+    }
     match fs::read_dir(&self.path) {
       Ok(paths) => {
         self.files = Ok(Vec::new());

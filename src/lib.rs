@@ -329,7 +329,7 @@ impl FileDialog {
         })
         .map(|entry| {
           let mut file_name = entry.file_name().into_string().unwrap();
-          #[cfg(unix)]
+          #[cfg(linux)]
           if file_name.starts_with('.') {
             self.hidden_files += 1;
           }

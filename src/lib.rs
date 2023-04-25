@@ -375,7 +375,7 @@ impl FileDialog {
         let read = self.read_dir_into();
 
         if let Ok(ref mut files) = self.files {
-          glidesort::sort_in_vec(files);
+          files.sort_unstable();
 
           if read < 5000 {
             self.completion.machine = Fst::from_iter_set(files.iter()).unwrap();
@@ -399,7 +399,7 @@ impl FileDialog {
       ReadDirState::Loading(_) => {
         if self.read_dir_into() < 5000 {
           if let Ok(ref mut files) = self.files {
-            glidesort::sort_in_vec(files);
+            files.sort_unstable();
 
             self.reading_state = ReadDirState::Fst(0, fst::raw::Builder::memory());
           }
@@ -625,7 +625,7 @@ impl FileDialog {
                     Some(Cow::Borrowed("Directory too large for completion"));
                   self.completion.too_large = true;
                 } else {
-                  glidesort::sort_in_vec(&mut paths);
+                  paths.sort_unstable();
                   self.completion.too_large = false;
                   self.completion.machine = Fst::from_iter_set(paths.iter()).unwrap();
                 }

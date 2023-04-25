@@ -357,6 +357,7 @@ impl FileDialog {
   }
 
   fn refresh(&mut self) {
+    #[cfg(unix)]
     self.hidden_files = 0;
     match fs::read_dir(&self.path) {
       Ok(paths) => {

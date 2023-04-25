@@ -329,7 +329,7 @@ impl FileDialog {
         })
         .map(|entry| {
           let mut file_name = entry.file_name().into_string().unwrap();
-          #[cfg(linux)]
+          #[cfg(unix)]
           if file_name.starts_with('.') {
             self.hidden_files += 1;
           }
@@ -357,6 +357,7 @@ impl FileDialog {
   }
 
   fn refresh(&mut self) {
+    #[cfg(unix)]
     self.hidden_files = 0;
     match fs::read_dir(&self.path) {
       Ok(paths) => {

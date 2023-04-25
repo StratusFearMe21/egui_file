@@ -86,7 +86,6 @@ pub struct FileDialog {
   reading_state: ReadDirState,
 
   current_pos: Option<Pos2>,
-  default_size: Vec2,
   scrollarea_max_height: f32,
   anchor: Option<(Align2, Vec2)>,
   filter: Option<Filter>,
@@ -113,7 +112,6 @@ impl Debug for FileDialog {
       .field("state", &self.state)
       .field("dialog_type", &self.dialog_type)
       .field("current_pos", &self.current_pos)
-      .field("default_size", &self.default_size)
       .field("scrollarea_max_height", &self.scrollarea_max_height)
       .field("anchor", &self.anchor)
       // Closures don't implement std::fmt::Debug.
@@ -136,7 +134,6 @@ impl Debug for FileDialog {
       .field("state", &self.state)
       .field("dialog_type", &self.dialog_type)
       .field("current_pos", &self.current_pos)
-      .field("default_size", &self.default_size)
       .field("scrollarea_max_height", &self.scrollarea_max_height)
       .field("anchor", &self.anchor)
       // Closures don't implement std::fmt::Debug.
@@ -199,7 +196,6 @@ impl FileDialog {
       state: State::Closed,
       dialog_type,
       current_pos: None,
-      default_size: vec2(512.0, 512.0),
       scrollarea_max_height: 320.0,
       anchor: None,
       filter,
@@ -227,12 +223,6 @@ impl FileDialog {
   /// Set the window position.
   pub fn current_pos(mut self, current_pos: impl Into<Pos2>) -> Self {
     self.current_pos = Some(current_pos.into());
-    self
-  }
-
-  /// Set the window default size.
-  pub fn default_size(mut self, default_size: impl Into<Vec2>) -> Self {
-    self.default_size = default_size.into();
     self
   }
 
@@ -488,7 +478,6 @@ impl FileDialog {
   fn ui(&mut self, ctx: &Context, is_open: &mut bool) {
     let mut window = Window::new(RichText::new(self.title()).strong())
       .open(is_open)
-      .default_size(self.default_size)
       .resizable(self.resizable)
       .collapsible(false);
 

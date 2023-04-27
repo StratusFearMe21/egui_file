@@ -531,7 +531,7 @@ impl FileDialog {
             command = Some(Command::Refresh);
           }
 
-          let response = ui.add_sized(
+          let mut response = ui.add_sized(
             ui.available_size(),
             TextEdit::singleline(&mut self.path_edit),
           );

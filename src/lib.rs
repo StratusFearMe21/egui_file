@@ -545,7 +545,7 @@ impl FileDialog {
             );
           }
 
-          if dbg!(ui.input(|i| i.key_pressed(Key::Tab))) {
+          if ui.input(|i| i.key_pressed(Key::Tab)) {
             response.request_focus();
             if let Some(mut text_state) = TextEditState::load(ui.ctx(), response.id) {
               text_state.set_ccursor_range(None);

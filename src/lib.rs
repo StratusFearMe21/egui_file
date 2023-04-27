@@ -533,8 +533,9 @@ impl FileDialog {
 
           let mut response = ui.add_sized(
             ui.available_size(),
-            TextEdit::singleline(&mut self.path_edit),
+            TextEdit::singleline(&mut self.path_edit).lock_focus(true),
           );
+
           if let Some(ref tooltip) = self.completion.current_tooltip {
             egui::containers::show_tooltip_for(
               ui.ctx(),
@@ -543,15 +544,19 @@ impl FileDialog {
               |ui| ui.label(tooltip.as_ref()),
             );
           }
-          if response.lost_focus() {
-            ui.memory_mut(|m| m.lock_focus(response.id, true));
-            if ui.input(|i| i.key_pressed(Key::Tab)) {
-              if let Some(mut text_state) = TextEditState::load(ui.ctx(), response.id) {
-                text_state.set_ccursor_range(None);
-                text_state.store(ui.ctx(), response.id);
-              }
-              response.mark_changed();
+
+          if dbg!(ui.input(|i| i.key_pressed(Key::Tab))) {
+            response.request_focus();
+            if let Some(mut text_state) = TextEditState::load(ui.ctx(), response.id) {
+              text_state.set_ccursor_range(None);
+              text_state.store(ui.ctx(), response.id);
             }
+            response.mark_changed();
+          }
+          if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+            self.completion.current_tooltip = None;
+            let current_path = Path::new(&self.path_edit);
+            command = Some(Command::Open(current_path.to_path_buf()));
           }
           'fst: {
             if response.changed() {
@@ -741,11 +746,6 @@ impl FileDialog {
                 }
               }
             }
-            if response.lost_focus() {
-              self.completion.current_tooltip = None;
-              let current_path = Path::new(&self.path_edit);
-              command = Some(Command::Open(current_path.to_path_buf()));
-            };
           };
         });
       });
@@ -930,118 +930,6 @@ impl FileDialog {
       )
     });
 
-    // Bottom file field.
-    ui.separator();
-    ui.horizontal(|ui| {
-      ui.label("File:");
-      ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-        if self.new_folder && ui.button("New Folder").clicked() {
-          command = Some(Command::CreateDirectory);
-        }
-
-        if self.rename {
-          ui.add_enabled_ui(self.can_rename(), |ui| {
-            if ui.button("Rename").clicked() {
-              if let Some(ref from) = self.selected_file {
-                let from = Path::new(from);
-                let to = from.with_file_name(&self.filename_edit);
-                command = Some(Command::Rename(from.to_path_buf(), to));
-              }
-            }
-          });
-        }
-
-        let result = ui.add_sized(
-          ui.available_size(),
-          TextEdit::singleline(&mut self.filename_edit),
-        );
-
-        if result.lost_focus()
-          && result.ctx.input(|i| i.key_pressed(egui::Key::Enter))
-          && !self.filename_edit.is_empty()
-        {
-          let mut path = self.path.join(&self.filename_edit);
-          match self.dialog_type {
-            DialogType::SelectFolder => {
-              command = Some(Command::Folder);
-            }
-            DialogType::OpenFile => {
-              if path.exists() {
-                path.pop();
-                command = Some(Command::Open(path));
-              }
-            }
-            DialogType::SaveFile => {
-              command = Some(match path.is_dir() {
-                true => {
-                  path.pop();
-                  Command::Open(path)
-                }
-                false => Command::Save(path),
-              });
-            }
-          }
-        }
-      });
-    });
-
-    // Confirm, Cancel buttons.
-    ui.horizontal(|ui| {
-      match self.dialog_type {
-        DialogType::SelectFolder => {
-          let should_open = match &self.selected_file {
-            Some(file) => file.ends_with(seperator!()),
-            None => true,
-          };
-
-          ui.horizontal(|ui| {
-            ui.set_enabled(should_open);
-            if ui.button("Open").clicked() {
-              command = Some(Command::Folder);
-            };
-          });
-        }
-        DialogType::OpenFile => {
-          ui.horizontal(|ui| {
-            ui.set_enabled(self.can_open());
-            if ui.button("Open").clicked() {
-              command = Some(Command::OpenSelected);
-            };
-          });
-        }
-        DialogType::SaveFile => {
-          let should_open_directory = match &self.selected_file {
-            Some(file) => file.ends_with(seperator!()),
-            None => false,
-          };
-
-          if should_open_directory {
-            if ui.button("Open").clicked() {
-              command = Some(Command::OpenSelected);
-            };
-          } else {
-            ui.horizontal(|ui| {
-              ui.set_enabled(self.can_save());
-              if ui.button("Save").clicked() {
-                let filename = &self.filename_edit;
-                let path = self.path.join(filename);
-                command = Some(Command::Save(path));
-              };
-            });
-          }
-        }
-      }
-
-      if ui.button("Cancel").clicked() {
-        command = Some(Command::Cancel);
-      }
-
-      #[cfg(unix)]
-      ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.checkbox(&mut self.show_hidden, "Show Hidden");
-      });
-    });
-
     if let Some(command) = command {
       match command {
         Command::Select(file) => {
@@ -1090,10 +978,12 @@ impl FileDialog {
         Command::UpDirectory => {
           if self.path.pop() {
             self.refresh();
-            #[cfg(not(windows))]
-            self.path_edit.push('/');
-            #[cfg(windows)]
-            self.path_edit.push('\\');
+            if !self.path_edit.ends_with(seperator!()) {
+              #[cfg(not(windows))]
+              self.path_edit.push('/');
+              #[cfg(windows)]
+              self.path_edit.push('\\');
+            }
           }
         }
         Command::CreateDirectory => {

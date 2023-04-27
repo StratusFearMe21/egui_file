@@ -86,7 +86,7 @@ pub struct FileDialog {
   reading_state: ReadDirState,
 
   current_pos: Option<Pos2>,
-  scrollarea_max_height: f32,
+  default_size: Vec2,
   anchor: Option<(Align2, Vec2)>,
   filter: Option<Filter>,
   resizable: bool,
@@ -112,7 +112,7 @@ impl Debug for FileDialog {
       .field("state", &self.state)
       .field("dialog_type", &self.dialog_type)
       .field("current_pos", &self.current_pos)
-      .field("scrollarea_max_height", &self.scrollarea_max_height)
+      .field("default_size", &self.default_size)
       .field("anchor", &self.anchor)
       // Closures don't implement std::fmt::Debug.
       // .field("filter", &self.filter)
@@ -134,7 +134,7 @@ impl Debug for FileDialog {
       .field("state", &self.state)
       .field("dialog_type", &self.dialog_type)
       .field("current_pos", &self.current_pos)
-      .field("scrollarea_max_height", &self.scrollarea_max_height)
+      .field("default_size", &self.default_size)
       .field("anchor", &self.anchor)
       // Closures don't implement std::fmt::Debug.
       // .field("filter", &self.filter)
@@ -196,7 +196,7 @@ impl FileDialog {
       state: State::Closed,
       dialog_type,
       current_pos: None,
-      scrollarea_max_height: 320.0,
+      default_size: vec2(512.0, 512.0),
       anchor: None,
       filter,
       resizable: true,
@@ -214,6 +214,11 @@ impl FileDialog {
     s
   }
 
+  pub fn default_filename(mut self, filename: impl Into<String>) -> Self {
+    self.filename_edit = filename.into();
+    self
+  }
+
   /// Set the window anchor.
   pub fn anchor(mut self, align: Align2, offset: impl Into<Vec2>) -> Self {
     self.anchor = Some((align, offset.into()));
@@ -226,9 +231,9 @@ impl FileDialog {
     self
   }
 
-  /// Set the maximum height for the inner [ScrollArea]
-  pub fn scrollarea_max_height(mut self, max: f32) -> Self {
-    self.scrollarea_max_height = max;
+  /// Set the window default size.
+  pub fn default_size(mut self, default_size: impl Into<Vec2>) -> Self {
+    self.default_size = default_size.into();
     self
   }
 
@@ -271,7 +276,6 @@ impl FileDialog {
   pub fn open(&mut self) {
     self.state = State::Open;
   }
-
   /// Resulting file path.
   pub fn path(&self) -> Option<PathBuf> {
     self.selected_file.as_ref().map(|f| self.path.join(f))
@@ -357,8 +361,11 @@ impl FileDialog {
   }
 
   fn refresh(&mut self) {
-    #[cfg(unix)]
-    self.hidden_files = 0;
+    cfg_if::cfg_if! {
+      if #[cfg(unix)] {
+        self.hidden_files = 0;
+      }
+    }
     match fs::read_dir(&self.path) {
       Ok(paths) => {
         self.files = Ok(Vec::new());
@@ -459,7 +466,7 @@ impl FileDialog {
   pub fn show(&mut self, ctx: &Context) -> &Self {
     self.state = match self.state {
       State::Open => {
-        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+        if ctx.input(|state| state.key_pressed(Key::Escape)) {
           self.state = State::Cancelled;
         }
 
@@ -510,246 +517,359 @@ impl FileDialog {
     self.read_more();
 
     // Top directory field with buttons.
-    ui.horizontal(|ui| {
-      ui.add_enabled_ui(self.path.parent().is_some(), |ui| {
-        let response = ui.button("⬆").on_hover_text_at_pointer("Parent Folder");
-        if response.clicked() {
-          command = Some(Command::UpDirectory);
-        }
-      });
-      ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.add_enabled_ui(matches!(self.reading_state, ReadDirState::Done), |ui| {
+    egui::TopBottomPanel::top("egui_file_top").show_inside(ui, |ui| {
+      ui.horizontal(|ui| {
+        ui.add_enabled_ui(self.path.parent().is_some(), |ui| {
+          let response = ui.button("⬆").on_hover_text_at_pointer("Parent Folder");
+          if response.clicked() {
+            command = Some(Command::UpDirectory);
+          }
+        });
+        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
           let response = ui.button("⟲").on_hover_text_at_pointer("Refresh");
           if response.clicked() {
             command = Some(Command::Refresh);
           }
-        });
 
-        let mut response = ui.add_sized(
-          ui.available_size(),
-          TextEdit::singleline(&mut self.path_edit),
-        );
-        if let Some(ref tooltip) = self.completion.current_tooltip {
-          egui::containers::show_tooltip_for(
-            ui.ctx(),
-            response.id.with("__tooltip"),
-            &response.rect,
-            |ui| ui.label(tooltip.as_ref()),
+          let response = ui.add_sized(
+            ui.available_size(),
+            TextEdit::singleline(&mut self.path_edit),
           );
-        }
-        if response.has_focus() {
-          ui.memory_mut(|m| m.lock_focus(response.id, true));
-          if ui.input(|i| i.key_pressed(Key::Tab)) {
-            if let Some(mut text_state) = TextEditState::load(ui.ctx(), response.id) {
-              text_state.set_ccursor_range(None);
-              text_state.store(ui.ctx(), response.id);
-            }
-            response.mark_changed();
-          }
-        }
-        'fst: {
-          if response.changed() {
-            let current_path = Path::new(&self.path_edit);
-            let file_name = current_path
-              .file_name()
-              .unwrap_or_default()
-              .to_str()
-              .unwrap_or_default();
-
-            let depth = memchr::memchr_iter(seperator!() as u8, self.path_edit.as_bytes()).count();
-            if depth != self.completion.folder_depth {
-              if let Ok(paths) = fs::read_dir(
-                if depth > self.completion.folder_depth || self.path_edit.ends_with(seperator!()) {
-                  &current_path
-                } else {
-                  current_path.parent().unwrap_or_else(
-                    #[cfg(windows)]
-                    || Path::new("C:\\"),
-                    #[cfg(not(windows))]
-                    || Path::new("/"),
-                  )
-                },
-              ) {
-                let mut paths: Vec<String> = paths
-                  .filter_map(|result| result.ok())
-                  .filter(|entry| {
-                    if entry.path().is_dir() {
-                      return true;
-                    }
-
-                    if self.dialog_type == DialogType::SelectFolder {
-                      return false;
-                    }
-
-                    if !entry.path().is_file() {
-                      return false;
-                    }
-
-                    // Filter.
-                    if let Some(filter) = self.filter {
-                      filter(&entry.path())
-                    } else {
-                      println!("No filter");
-                      false
-                    }
-                  })
-                  .filter_map(|entry| {
-                    let mut file_name = entry.file_name().into_string().unwrap();
-                    #[cfg(unix)]
-                    if file_name.starts_with('.') {
-                      return None;
-                    }
-                    if entry.path().is_dir() {
-                      #[cfg(not(windows))]
-                      file_name.push('/');
-                      #[cfg(windows)]
-                      file_name.push('\\');
-                    }
-                    Some(file_name)
-                  })
-                  .take(1000)
-                  .collect();
-
-                if paths.len() == 1000 {
-                  self.completion.current_tooltip =
-                    Some(Cow::Borrowed("Directory too large for completion"));
-                  self.completion.too_large = true;
-                } else {
-                  paths.sort_unstable();
-                  self.completion.too_large = false;
-                  self.completion.machine = Fst::from_iter_set(paths.iter()).unwrap();
-                }
-              } else {
-                break 'fst;
-              }
-              self.completion.folder_depth = depth;
-            }
-
-            enum StreamType<'f> {
-              StartsWith(fst::raw::Stream<'f, StartsWith<Str<'f>>>),
-              Root(fst::raw::Stream<'f, AlwaysMatch>),
-            }
-
-            impl<'a, 'f> Streamer<'a> for StreamType<'f> {
-              type Item = &'a [u8];
-
-              fn next(&'a mut self) -> Option<Self::Item> {
-                match self {
-                  StreamType::StartsWith(s) => s.next().map(|f| f.0),
-                  StreamType::Root(r) => r.next().map(|f| f.0),
-                }
-              }
-
-              fn next_start_node(&'a self) -> Option<fst::raw::Node<'_>> {
-                match self {
-                  StreamType::StartsWith(s) => s.next_start_node(),
-                  StreamType::Root(r) => r.next_start_node(),
-                }
-              }
-            }
-
-            if !self.completion.too_large {
-              let matcher = fst::automaton::Str::new(file_name).starts_with();
-              let backspace = ui.input(|i| i.key_pressed(Key::Backspace));
-              let mut stream = if self.path_edit.ends_with(seperator!()) || backspace {
-                StreamType::Root(self.completion.machine.stream())
-              } else {
-                StreamType::StartsWith(
-                  self
-                    .completion
-                    .machine
-                    .search(matcher)
-                    .gt(file_name)
-                    .into_stream(),
-                )
-              };
-
-              if let Some(mut node) = stream.next_start_node() {
-                if node.len() == 1 && !node.is_final() && !backspace {
-                  let ccursor_start = self.path_edit.len();
-                  while node.len() == 1 {
-                    let t = node.transitions().next().unwrap();
-                    self.path_edit.push(t.inp as char);
-                    node = self.completion.machine.node(t.addr);
-                  }
-                  let ccursor_end = self.path_edit.len();
-
-                  if let Some(mut text_state) = TextEditState::load(ui.ctx(), response.id) {
-                    text_state.set_ccursor_range(Some(egui::text_edit::CCursorRange {
-                      primary: CCursor {
-                        index: ccursor_start,
-                        prefer_next_row: true,
-                      },
-                      secondary: CCursor {
-                        index: ccursor_end,
-                        prefer_next_row: true,
-                      },
-                    }));
-
-                    text_state.store(ui.ctx(), response.id);
-                  }
-
-                  self.completion.current_tooltip = None;
-                } else {
-                  let mut tooltip = String::new();
-                  let mut num_processed = 0;
-                  while let Some(key) = stream.next() {
-                    if num_processed > 500 {
-                      break;
-                    }
-                    let key = unsafe { std::str::from_utf8_unchecked(key) };
-                    #[cfg(unix)]
-                    if !self.show_hidden && key.starts_with('.') {
-                      continue;
-                    }
-                    std::fmt::Write::write_fmt(
-                      &mut tooltip,
-                      format_args!(
-                        "{}{}\n",
-                        if key.ends_with(seperator!()) {
-                          "🗀 "
-                        } else {
-                          "🗋 "
-                        },
-                        key
-                      ),
-                    )
-                    .unwrap();
-                    num_processed += 1;
-                  }
-                  if num_processed > 500 {
-                    tooltip.push('…');
-                  } else {
-                    tooltip.pop();
-                  }
-                  if !tooltip.is_empty() {
-                    self.completion.current_tooltip = Some(Cow::Owned(tooltip));
-                  } else {
-                    self.completion.current_tooltip = None;
-                  }
-                }
-              } else {
-                break 'fst;
-              }
-            }
+          if let Some(ref tooltip) = self.completion.current_tooltip {
+            egui::containers::show_tooltip_for(
+              ui.ctx(),
+              response.id.with("__tooltip"),
+              &response.rect,
+              |ui| ui.label(tooltip.as_ref()),
+            );
           }
           if response.lost_focus() {
-            self.completion.current_tooltip = None;
-            let current_path = Path::new(&self.path_edit);
-            command = Some(Command::Open(current_path.to_path_buf()));
+            ui.memory_mut(|m| m.lock_focus(response.id, true));
+            if ui.input(|i| i.key_pressed(Key::Tab)) {
+              if let Some(mut text_state) = TextEditState::load(ui.ctx(), response.id) {
+                text_state.set_ccursor_range(None);
+                text_state.store(ui.ctx(), response.id);
+              }
+              response.mark_changed();
+            }
+          }
+          'fst: {
+            if response.changed() {
+              let current_path = Path::new(&self.path_edit);
+              let file_name = current_path
+                .file_name()
+                .unwrap_or_default()
+                .to_str()
+                .unwrap_or_default();
+
+              let depth =
+                memchr::memchr_iter(seperator!() as u8, self.path_edit.as_bytes()).count();
+              if depth != self.completion.folder_depth {
+                if let Ok(paths) = fs::read_dir(
+                  if depth > self.completion.folder_depth || self.path_edit.ends_with(seperator!())
+                  {
+                    &current_path
+                  } else {
+                    current_path.parent().unwrap_or_else(
+                      #[cfg(windows)]
+                      || Path::new("C:\\"),
+                      #[cfg(not(windows))]
+                      || Path::new("/"),
+                    )
+                  },
+                ) {
+                  let mut paths: Vec<String> = paths
+                    .filter_map(|result| result.ok())
+                    .filter(|entry| {
+                      if entry.path().is_dir() {
+                        return true;
+                      }
+
+                      if self.dialog_type == DialogType::SelectFolder {
+                        return false;
+                      }
+
+                      if !entry.path().is_file() {
+                        return false;
+                      }
+
+                      // Filter.
+                      if let Some(filter) = self.filter {
+                        filter(&entry.path())
+                      } else {
+                        println!("No filter");
+                        false
+                      }
+                    })
+                    .filter_map(|entry| {
+                      let mut file_name = entry.file_name().into_string().unwrap();
+                      #[cfg(unix)]
+                      if file_name.starts_with('.') {
+                        return None;
+                      }
+                      if entry.path().is_dir() {
+                        #[cfg(not(windows))]
+                        file_name.push('/');
+                        #[cfg(windows)]
+                        file_name.push('\\');
+                      }
+                      Some(file_name)
+                    })
+                    .take(1000)
+                    .collect();
+
+                  if paths.len() == 1000 {
+                    self.completion.current_tooltip =
+                      Some(Cow::Borrowed("Directory too large for completion"));
+                    self.completion.too_large = true;
+                  } else {
+                    paths.sort_unstable();
+                    self.completion.too_large = false;
+                    self.completion.machine = Fst::from_iter_set(paths.iter()).unwrap();
+                  }
+                } else {
+                  break 'fst;
+                }
+                self.completion.folder_depth = depth;
+              }
+
+              enum StreamType<'f> {
+                StartsWith(fst::raw::Stream<'f, StartsWith<Str<'f>>>),
+                Root(fst::raw::Stream<'f, AlwaysMatch>),
+              }
+
+              impl<'a, 'f> Streamer<'a> for StreamType<'f> {
+                type Item = &'a [u8];
+
+                fn next(&'a mut self) -> Option<Self::Item> {
+                  match self {
+                    StreamType::StartsWith(s) => s.next().map(|f| f.0),
+                    StreamType::Root(r) => r.next().map(|f| f.0),
+                  }
+                }
+
+                fn next_start_node(&'a self) -> Option<fst::raw::Node<'_>> {
+                  match self {
+                    StreamType::StartsWith(s) => s.next_start_node(),
+                    StreamType::Root(r) => r.next_start_node(),
+                  }
+                }
+              }
+
+              if !self.completion.too_large {
+                let matcher = fst::automaton::Str::new(file_name).starts_with();
+                let backspace = ui.input(|i| i.key_pressed(Key::Backspace));
+                let mut stream = if self.path_edit.ends_with(seperator!()) || backspace {
+                  StreamType::Root(self.completion.machine.stream())
+                } else {
+                  StreamType::StartsWith(
+                    self
+                      .completion
+                      .machine
+                      .search(matcher)
+                      .gt(file_name)
+                      .into_stream(),
+                  )
+                };
+
+                if let Some(mut node) = stream.next_start_node() {
+                  if node.len() == 1 && !node.is_final() && !backspace {
+                    let ccursor_start = self.path_edit.len();
+                    while node.len() == 1 {
+                      let t = node.transitions().next().unwrap();
+                      self.path_edit.push(t.inp as char);
+                      node = self.completion.machine.node(t.addr);
+                    }
+                    let ccursor_end = self.path_edit.len();
+
+                    if let Some(mut text_state) = TextEditState::load(ui.ctx(), response.id) {
+                      text_state.set_ccursor_range(Some(egui::text_edit::CCursorRange {
+                        primary: CCursor {
+                          index: ccursor_start,
+                          prefer_next_row: true,
+                        },
+                        secondary: CCursor {
+                          index: ccursor_end,
+                          prefer_next_row: true,
+                        },
+                      }));
+
+                      text_state.store(ui.ctx(), response.id);
+                    }
+
+                    self.completion.current_tooltip = None;
+                  } else {
+                    let mut tooltip = String::new();
+                    let mut num_processed = 0;
+                    while let Some(key) = stream.next() {
+                      if num_processed > 500 {
+                        break;
+                      }
+                      let key = unsafe { std::str::from_utf8_unchecked(key) };
+                      #[cfg(unix)]
+                      if !self.show_hidden && key.starts_with('.') {
+                        continue;
+                      }
+                      std::fmt::Write::write_fmt(
+                        &mut tooltip,
+                        format_args!(
+                          "{}{}\n",
+                          if key.ends_with(seperator!()) {
+                            "🗀 "
+                          } else {
+                            "🗋 "
+                          },
+                          key
+                        ),
+                      )
+                      .unwrap();
+                      num_processed += 1;
+                    }
+                    if num_processed > 500 {
+                      tooltip.push('…');
+                    } else {
+                      tooltip.pop();
+                    }
+                    if !tooltip.is_empty() {
+                      self.completion.current_tooltip = Some(Cow::Owned(tooltip));
+                    } else {
+                      self.completion.current_tooltip = None;
+                    }
+                  }
+                } else {
+                  break 'fst;
+                }
+              }
+            }
+            if response.lost_focus() {
+              self.completion.current_tooltip = None;
+              let current_path = Path::new(&self.path_edit);
+              command = Some(Command::Open(current_path.to_path_buf()));
+            };
           };
+        });
+      });
+    });
+
+    // Bottom file field.
+    egui::TopBottomPanel::bottom("egui_file_bottom").show_inside(ui, |ui| {
+      ui.add_space(ui.spacing().item_spacing.y * 2.0);
+      ui.horizontal(|ui| {
+        ui.label("File:");
+        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+          if self.new_folder && ui.button("New Folder").clicked() {
+            command = Some(Command::CreateDirectory);
+          }
+
+          if self.rename {
+            ui.add_enabled_ui(self.can_rename(), |ui| {
+              if ui.button("Rename").clicked() {
+                if let Some(ref from) = self.selected_file {
+                  let from = Path::new(from).to_path_buf();
+                  let to = from.with_file_name(&self.filename_edit);
+                  command = Some(Command::Rename(from, to));
+                }
+              }
+            });
+          }
+
+          let result = ui.add_sized(
+            ui.available_size(),
+            TextEdit::singleline(&mut self.filename_edit),
+          );
+
+          if result.lost_focus()
+            && result
+              .ctx
+              .input(|state| state.key_pressed(egui::Key::Enter))
+            && !self.filename_edit.is_empty()
+          {
+            let path = self.path.join(&self.filename_edit);
+            match self.dialog_type {
+              DialogType::SelectFolder => {
+                command = Some(Command::Folder);
+              }
+              DialogType::OpenFile => {
+                if path.exists() {
+                  command = Some(Command::Open(path));
+                }
+              }
+              DialogType::SaveFile => {
+                command = Some(match path.is_dir() {
+                  true => Command::Open(path),
+                  false => Command::Save(path),
+                });
+              }
+            }
+          }
+        });
+      });
+
+      ui.add_space(ui.spacing().item_spacing.y);
+
+      // Confirm, Cancel buttons.
+      ui.horizontal(|ui| {
+        match self.dialog_type {
+          DialogType::SelectFolder => {
+            let should_open = match &self.selected_file {
+              Some(file) => file.ends_with(seperator!()),
+              None => true,
+            };
+
+            ui.horizontal(|ui| {
+              ui.set_enabled(should_open);
+              if ui.button("Open").clicked() {
+                command = Some(Command::Folder);
+              };
+            });
+          }
+          DialogType::OpenFile => {
+            ui.horizontal(|ui| {
+              ui.set_enabled(self.can_open());
+              if ui.button("Open").clicked() {
+                command = Some(Command::OpenSelected);
+              };
+            });
+          }
+          DialogType::SaveFile => {
+            let should_open_directory = match &self.selected_file {
+              Some(file) => file.ends_with(seperator!()),
+              None => false,
+            };
+
+            if should_open_directory {
+              if ui.button("Open").clicked() {
+                command = Some(Command::OpenSelected);
+              };
+            } else {
+              ui.horizontal(|ui| {
+                ui.set_enabled(self.can_save());
+                if ui.button("Save").clicked() {
+                  let filename = &self.filename_edit;
+                  let path = self.path.join(filename);
+                  command = Some(Command::Save(path));
+                };
+              });
+            }
+          }
         }
+
+        if ui.button("Cancel").clicked() {
+          command = Some(Command::Cancel);
+        }
+
+        #[cfg(unix)]
+        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+          ui.checkbox(&mut self.show_hidden, "Show Hidden");
+        });
       });
     });
 
     // Rows with files.
-    ui.separator();
-
     let row_height = ui.spacing().interact_size.y;
 
-    ScrollArea::vertical()
-      .max_height(self.scrollarea_max_height)
-      .show_rows(
+    egui::CentralPanel::default().show_inside(ui, |ui| {
+      ScrollArea::vertical().show_rows(
         ui,
         row_height,
         #[cfg(unix)]
@@ -807,7 +927,8 @@ impl FileDialog {
             ui.label(e.to_string());
           }
         },
-      );
+      )
+    });
 
     // Bottom file field.
     ui.separator();

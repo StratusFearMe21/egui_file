@@ -9,9 +9,10 @@ keywords = ["file-dialog", "file-picker"]
 license = "MIT"
 name = "egui_file"
 repository = "https://github.com/Barugon/egui_file"
-version = "0.6.0"
+version = "0.8.1"
 
 [dependencies]
+cfg-if = "1.0.0"
 fst = { git = "https://github.com/StratusFearMe21/fst.git" }
 memchr = "2.5.0"
 parking_lot = "0.12.1"
